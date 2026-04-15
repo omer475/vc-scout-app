@@ -1,7 +1,18 @@
 import { useState, useEffect, useCallback } from 'react'
 import './App.css'
 
-const API = 'http://localhost:8000/api'
+// Static mode: when VITE_STATIC=1 is set at build time (e.g. Vercel deploy),
+// the app loads a snapshot from /data.json instead of hitting a live backend.
+// All mutation actions (scan, delete, toggle) are disabled in this mode.
+const STATIC_MODE = import.meta.env.VITE_STATIC === '1'
+const API = STATIC_MODE ? null : 'http://localhost:8000/api'
+let _snapshot = null
+async function loadSnapshot() {
+  if (_snapshot) return _snapshot
+  const res = await fetch('/data.json')
+  _snapshot = await res.json()
+  return _snapshot
+}
 
 const COUNTRIES = [
   'Turkey', 'USA', 'Germany', 'UK', 'France', 'Netherlands', 'Spain',
@@ -51,6 +62,7 @@ function App() {
 
   const fetchStats = useCallback(async () => {
     try {
+      if (STATIC_MODE) { setStats((await loadSnapshot()).dashboard); return }
       const res = await fetch(`${API}/dashboard`)
       if (res.ok) setStats(await res.json())
     } catch {}
@@ -58,6 +70,7 @@ function App() {
 
   const fetchSources = useCallback(async () => {
     try {
+      if (STATIC_MODE) { setSources((await loadSnapshot()).sources); return }
       const res = await fetch(`${API}/sources`)
       if (res.ok) setSources(await res.json())
     } catch {}
@@ -65,6 +78,7 @@ function App() {
 
   const fetchTopics = useCallback(async () => {
     try {
+      if (STATIC_MODE) { setTopics((await loadSnapshot()).topics); return }
       const res = await fetch(`${API}/topics`)
       if (res.ok) setTopics(await res.json())
     } catch {}
@@ -72,6 +86,30 @@ function App() {
 
   const fetchCompanies = useCallback(async () => {
     try {
+      if (STATIC_MODE) {
+        const snap = await loadSnapshot()
+        let list = snap.companies
+        if (showNewOnly) list = list.filter(c => c.is_new)
+        if (showRaisingOnly) list = list.filter(c => c.is_raising)
+        if (activityFilter) list = list.filter(c => c.activity_type === activityFilter)
+        if (searchQuery) {
+          const q = searchQuery.toLowerCase()
+          list = list.filter(c =>
+            (c.name && c.name.toLowerCase().includes(q)) ||
+            (c.description && c.description.toLowerCase().includes(q)) ||
+            (c.industry && c.industry.toLowerCase().includes(q)) ||
+            (c.founders && c.founders.join(' ').toLowerCase().includes(q))
+          )
+        }
+        if (yearMin) list = list.filter(c => c.founded_year && c.founded_year >= parseInt(yearMin))
+        if (yearMax) list = list.filter(c => c.founded_year && c.founded_year <= parseInt(yearMax))
+        if (locationFilter) {
+          const l = locationFilter.toLowerCase()
+          list = list.filter(c => (c.location || '').toLowerCase().includes(l))
+        }
+        setCompanies(list)
+        return
+      }
       const params = new URLSearchParams()
       if (showNewOnly) params.set('new_only', 'true')
       if (showRaisingOnly) params.set('raising_only', 'true')
@@ -246,10 +284,12 @@ function App() {
     <div className="app">
       <header>
         <div className="header-row">
-          <h1>VC Scout</h1>
-          <button className={`btn-primary ${scanning ? 'loading' : ''}`} onClick={() => { if (!scanning) setShowScanModal(true) }} disabled={scanning}>
-            {scanning ? 'Scanning...' : 'Run Scan'}
-          </button>
+          <h1>VC Scout {STATIC_MODE && <span className="static-badge">Read-only snapshot</span>}</h1>
+          {!STATIC_MODE && (
+            <button className={`btn-primary ${scanning ? 'loading' : ''}`} onClick={() => { if (!scanning) setShowScanModal(true) }} disabled={scanning}>
+              {scanning ? 'Scanning...' : 'Run Scan'}
+            </button>
+          )}
         </div>
         <nav>
           {tabs.map(t => (
@@ -421,12 +461,14 @@ function App() {
           <section>
             <h2>Sources</h2>
             <p className="muted">Add the websites you want to scan for companies. The crawler will follow internal links to find portfolio/company pages.</p>
+            {!STATIC_MODE && (
             <form className="inline-form" onSubmit={addSource}>
               <input placeholder="Name" value={newSource.name} onChange={e => setNewSource({ ...newSource, name: e.target.value })} />
               <input type="url" placeholder="https://..." value={newSource.url} onChange={e => setNewSource({ ...newSource, url: e.target.value })} />
               <button type="submit" className="btn-primary">Add</button>
               <button type="button" className="btn-outline" onClick={seedTurkishSources}>Load Turkish Raising Sources</button>
             </form>
+            )}
             {sources.length === 0 && <p className="empty">No sources yet.</p>}
             <div className="list">
               {sources.map(s => (
@@ -437,10 +479,15 @@ function App() {
                     {s.last_scraped_at && <span className="muted small">Scraped: {new Date(s.last_scraped_at).toLocaleString()}</span>}
                   </div>
                   <div className="list-actions">
-                    <button className={`btn-sm ${s.is_active ? 'on' : 'off'}`} onClick={() => toggleSource(s.id)}>
+                    <span className={`btn-sm ${s.is_active ? 'on' : 'off'}`}>
                       {s.is_active ? 'Active' : 'Off'}
-                    </button>
-                    <button className="btn-sm danger" onClick={() => deleteSource(s.id)}>Delete</button>
+                    </span>
+                    {!STATIC_MODE && (
+                      <>
+                        <button className={`btn-sm ${s.is_active ? 'on' : 'off'}`} onClick={() => toggleSource(s.id)}>Toggle</button>
+                        <button className="btn-sm danger" onClick={() => deleteSource(s.id)}>Delete</button>
+                      </>
+                    )}
                   </div>
                 </div>
               ))}
@@ -495,8 +542,8 @@ function App() {
                   <span className="muted">–</span>
                   <input type="number" placeholder="To" value={yearMax} onChange={e => setYearMax(e.target.value)} className="year-input" min="1900" max="2030" />
                 </div>
-                <button className="btn-outline" onClick={exportExcel}>Export Excel</button>
-                <button className="btn-outline" onClick={markAllSeen}>Mark All Seen</button>
+                {!STATIC_MODE && <button className="btn-outline" onClick={exportExcel}>Export Excel</button>}
+                {!STATIC_MODE && <button className="btn-outline" onClick={markAllSeen}>Mark All Seen</button>}
               </div>
             </div>
             {companies.length === 0 && <p className="empty">No companies found. Run a scan to discover companies.</p>}
@@ -546,8 +593,8 @@ function App() {
                           <td className="td-founded">{c.founded_year || <span className="muted">-</span>}</td>
                           <td className="td-website">{c.website ? <a href={c.website} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()}>{c.website.replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, '')}</a> : <span className="muted">-</span>}</td>
                           <td className="td-actions">
-                            {c.is_new && <button className="btn-sm" onClick={e => { e.stopPropagation(); markSeen(c.id) }}>Seen</button>}
-                            <button className="btn-sm danger" onClick={e => { e.stopPropagation(); deleteCompany(c.id) }}>Del</button>
+                            {!STATIC_MODE && c.is_new && <button className="btn-sm" onClick={e => { e.stopPropagation(); markSeen(c.id) }}>Seen</button>}
+                            {!STATIC_MODE && <button className="btn-sm danger" onClick={e => { e.stopPropagation(); deleteCompany(c.id) }}>Del</button>}
                           </td>
                         </tr>
                         {expandedRow === c.id && (
