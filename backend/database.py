@@ -7,6 +7,8 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./vc_scout.db")
+# Strip any whitespace/newlines that sneak in when pasting wrapped URLs
+DATABASE_URL = "".join(DATABASE_URL.split())
 # Some providers still hand out the legacy postgres:// scheme
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
