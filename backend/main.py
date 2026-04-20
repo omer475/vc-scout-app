@@ -27,9 +27,11 @@ from scraper import crawl_and_extract
 
 app = FastAPI(title="VC Scout", version="2.0.0")
 
+_cors_env = os.environ.get("CORS_ORIGINS", "*").strip()
+_cors_origins = ["*"] if _cors_env == "*" else [o.strip() for o in _cors_env.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

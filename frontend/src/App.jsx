@@ -5,7 +5,8 @@ import './App.css'
 // the app loads a snapshot from /data.json instead of hitting a live backend.
 // All mutation actions (scan, delete, toggle) are disabled in this mode.
 const STATIC_MODE = import.meta.env.VITE_STATIC === '1'
-const API = STATIC_MODE ? null : 'http://localhost:8000/api'
+const API_BASE = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '')
+const API = STATIC_MODE ? null : `${API_BASE}/api`
 let _snapshot = null
 async function loadSnapshot() {
   if (_snapshot) return _snapshot

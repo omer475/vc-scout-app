@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: vc-scout-backend
+    runtime: docker
+    plan: free
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/sources
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
