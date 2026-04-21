@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import os
@@ -22,7 +23,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from openpyxl import Workbook
 
-from database import init_db, get_db, Source, Topic, Company, ScanLog, company_topics
+from database import init_db, get_db, SessionLocal, Source, Topic, Company, ScanLog, company_topics
 from scraper import crawl_and_extract
 
 app = FastAPI(title="VC Scout", version="2.0.0")
@@ -123,13 +124,20 @@ class ScanConfig(BaseModel):
     country: Optional[str] = None
     topic_ids: Optional[list[int]] = None
 
-class ScanResult(BaseModel):
+class ScanStart(BaseModel):
     scan_id: int
+    status: str
+    sources_total: int
+
+class ScanStatus(BaseModel):
+    scan_id: int
+    status: str
     sources_scanned: int
+    sources_total: int
     new_companies_found: int
     pages_crawled: int
-    status: str
-    companies: list[CompanyOut]
+    started_at: datetime
+    finished_at: Optional[datetime] = None
 
 class DashboardStats(BaseModel):
     total_companies: int
@@ -218,143 +226,175 @@ def toggle_topic(topic_id: int, db: Session = Depends(get_db)):
 
 # ── Scan ──
 
-@app.post("/api/scan", response_model=ScanResult)
+PER_SOURCE_TIMEOUT_SECONDS = 180
+
+
+async def _scan_one_source(source: Source, country: Optional[str], active_topics: list[Topic], db: Session, batch_names: set[str]) -> int:
+    """Scrape one source and persist matching companies. Returns (pages_crawled, new_company_count)."""
+    import re as _re
+    blob = (source.name + " " + source.url).lower()
+    if any(kw in blob for kw in ["crowdfunding", "startupfon", "fonbulucu", "fongogo", "seedblink", "arikovani", "arıkovan"]):
+        mode = "crowdfunding"
+    elif any(kw in blob for kw in ["vc portfolio", "vc ", "212.vc", "revo.vc", "collectivespark", "earlybird", "logo ventures", "maki", "diffusion"]):
+        mode = "vc_portfolio"
+    elif any(kw in blob for kw in ["webrazzi", "yatirim-turu", "yatırım-turu", "girisim-haberleri", "girisimhaber", "startupsmagazine", "news"]):
+        mode = "news"
+    elif any(kw in blob for kw in ["cekirdek", "çekirdek", "kworks", "demo-day", "demo day", "cohort", "accelerator", "techstars"]):
+        mode = "demo_day"
+    else:
+        mode = "default"
+    force_browser = any(kw in blob for kw in ["startupfon", "fonbulucu", "seedblink", "arikovani", "arıkovan", "212.vc", "revo.vc", "collectivespark"])
+
+    scraped, pages = await crawl_and_extract(
+        url=source.url,
+        source_name=source.name,
+        topics=None,
+        country=country or None,
+        source_mode=mode,
+        force_browser=force_browser,
+    )
+    source.last_scraped_at = datetime.utcnow()
+
+    new_count = 0
+    for sc in scraped:
+        if not sc.is_raising:
+            continue
+        if country:
+            loc_lower = (sc.location or "").lower()
+            country_lower = country.lower()
+            TURKEY_TOKENS = ["turkey", "türkiye", "turkiye", "istanbul", "ankara", "izmir", "bursa", "antalya", "eskisehir", "eskişehir", "kocaeli"]
+            is_turkey_req = country_lower in ("turkey", "türkiye", "turkiye")
+            if sc.activity_type == "recent_round":
+                if is_turkey_req:
+                    if not loc_lower or not any(t in loc_lower for t in TURKEY_TOKENS):
+                        continue
+                elif not loc_lower or country_lower not in loc_lower:
+                    continue
+            else:
+                if loc_lower and country_lower not in loc_lower and not (is_turkey_req and any(t in loc_lower for t in TURKEY_TOKENS)):
+                    continue
+
+        norm_name = _re.sub(r'[^a-z0-9]', '', sc.name.lower())
+        if norm_name in batch_names:
+            continue
+        is_dup = False
+        for existing in db.query(Company).all():
+            if _re.sub(r'[^a-z0-9]', '', existing.name.lower()) == norm_name:
+                is_dup = True
+                break
+        if is_dup:
+            continue
+        batch_names.add(norm_name)
+
+        company = Company(
+            name=sc.name,
+            description=sc.description,
+            website=sc.website,
+            source_url=sc.source_url,
+            source_name=sc.source_name,
+            page_url=sc.page_url,
+            industry=sc.industry,
+            location=sc.location,
+            founded_year=sc.founded_year,
+            founders=json.dumps(sc.founders) if sc.founders else None,
+            funding_stage=sc.funding_stage,
+            seeking_amount=sc.seeking_amount,
+            is_raising=bool(sc.is_raising),
+            activity_type=sc.activity_type,
+            raising_evidence=sc.raising_evidence,
+            is_new=True,
+            is_seen=False,
+        )
+
+        searchable = f"{sc.name} {sc.description} {sc.industry}".lower()
+        for topic in active_topics:
+            pattern = r'\b' + _re.escape(topic.name.lower()) + r'\b'
+            if _re.search(pattern, searchable):
+                company.topics.append(topic)
+
+        db.add(company)
+        new_count += 1
+
+    return pages, new_count
+
+
+async def _run_scan_background(scan_id: int, country: Optional[str], topic_ids: Optional[list[int]]):
+    db = SessionLocal()
+    try:
+        scan = db.query(ScanLog).filter(ScanLog.id == scan_id).first()
+        if not scan:
+            return
+
+        sources = db.query(Source).filter(Source.is_active == True).all()
+        if topic_ids:
+            active_topics = db.query(Topic).filter(Topic.id.in_(topic_ids)).all()
+        else:
+            active_topics = db.query(Topic).filter(Topic.is_active == True).all()
+
+        batch_names: set[str] = set()
+        for source in sources:
+            try:
+                pages, new_count = await asyncio.wait_for(
+                    _scan_one_source(source, country, active_topics, db, batch_names),
+                    timeout=PER_SOURCE_TIMEOUT_SECONDS,
+                )
+                scan.sources_scanned = (scan.sources_scanned or 0) + 1
+                scan.pages_crawled = (scan.pages_crawled or 0) + pages
+                scan.new_companies_found = (scan.new_companies_found or 0) + new_count
+                db.commit()
+            except asyncio.TimeoutError:
+                print(f"[scan {scan_id}] source {source.url} timed out after {PER_SOURCE_TIMEOUT_SECONDS}s")
+                db.rollback()
+            except Exception as e:
+                print(f"[scan {scan_id}] source {source.url} errored: {e}")
+                db.rollback()
+
+        scan.finished_at = datetime.utcnow()
+        scan.status = "completed"
+        db.commit()
+    except Exception as e:
+        print(f"[scan {scan_id}] fatal: {e}")
+        try:
+            scan.status = "failed"
+            scan.finished_at = datetime.utcnow()
+            db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+@app.post("/api/scan", response_model=ScanStart)
 async def run_scan(config: ScanConfig = ScanConfig(), db: Session = Depends(get_db)):
     sources = db.query(Source).filter(Source.is_active == True).all()
     if not sources:
         raise HTTPException(400, "No active sources. Add sources first.")
 
-    # Use selected topics if provided, otherwise all active topics
-    if config.topic_ids:
-        active_topics = db.query(Topic).filter(Topic.id.in_(config.topic_ids)).all()
-    else:
-        active_topics = db.query(Topic).filter(Topic.is_active == True).all()
-
     scan = ScanLog(status="running")
     db.add(scan)
     db.commit()
+    db.refresh(scan)
 
-    new_companies = []
-    sources_scanned = 0
-    total_pages = 0
-    batch_names: set[str] = set()  # shared across all sources in this scan
+    asyncio.create_task(_run_scan_background(scan.id, config.country, config.topic_ids))
 
-    for source in sources:
-        try:
-            blob = (source.name + " " + source.url).lower()
-            if any(kw in blob for kw in ["crowdfunding", "startupfon", "fonbulucu", "fongogo", "seedblink", "arikovani", "arıkovan"]):
-                mode = "crowdfunding"
-            elif any(kw in blob for kw in ["vc portfolio", "vc ", "212.vc", "revo.vc", "collectivespark", "earlybird", "logo ventures", "maki", "diffusion"]):
-                mode = "vc_portfolio"
-            elif any(kw in blob for kw in ["webrazzi", "yatirim-turu", "yatırım-turu", "girisim-haberleri", "girisimhaber", "startupsmagazine", "news"]):
-                mode = "news"
-            elif any(kw in blob for kw in ["cekirdek", "çekirdek", "kworks", "demo-day", "demo day", "cohort", "accelerator", "techstars"]):
-                mode = "demo_day"
-            else:
-                mode = "default"
-            force_browser = any(kw in blob for kw in ["startupfon", "fonbulucu", "seedblink", "arikovani", "arıkovan", "212.vc", "revo.vc", "collectivespark"])
-            scraped, pages = await crawl_and_extract(
-                url=source.url,
-                source_name=source.name,
-                topics=None,
-                country=config.country or None,
-                source_mode=mode,
-                force_browser=force_browser,
-            )
-            sources_scanned += 1
-            total_pages += pages
-            source.last_scraped_at = datetime.utcnow()
+    return ScanStart(scan_id=scan.id, status="running", sources_total=len(sources))
 
-            for sc in scraped:
-                # Only persist companies that are actively seeking investment
-                if not sc.is_raising:
-                    continue
-                # If a country filter is set, keep only companies whose location matches
-                if config.country:
-                    loc_lower = (sc.location or "").lower()
-                    country_lower = config.country.lower()
-                    TURKEY_TOKENS = ["turkey", "türkiye", "turkiye", "istanbul", "ankara", "izmir", "bursa", "antalya", "eskisehir", "eskişehir", "kocaeli"]
-                    is_turkey_req = country_lower in ("turkey", "türkiye", "turkiye")
-                    if sc.activity_type == "recent_round":
-                        # News articles mix Turkish + global startups — REQUIRE explicit Turkey location (no default)
-                        if is_turkey_req:
-                            if not loc_lower or not any(t in loc_lower for t in TURKEY_TOKENS):
-                                continue
-                        elif not loc_lower or country_lower not in loc_lower:
-                            continue
-                    else:
-                        # Crowdfunding + demo_day sources are country-specific by design — allow empty location
-                        if loc_lower and country_lower not in loc_lower and not (is_turkey_req and any(t in loc_lower for t in TURKEY_TOKENS)):
-                            continue
-                # Normalize name for dedup: lowercase, strip non-alphanum
-                import re as _re2
-                norm_name = _re2.sub(r'[^a-z0-9]', '', sc.name.lower())
-                # Skip dups against both committed rows AND the current batch
-                if norm_name in batch_names:
-                    continue
-                is_dup = False
-                for existing in db.query(Company).all():
-                    if _re2.sub(r'[^a-z0-9]', '', existing.name.lower()) == norm_name:
-                        is_dup = True
-                        break
-                if is_dup:
-                    continue
-                batch_names.add(norm_name)
 
-                company = Company(
-                    name=sc.name,
-                    description=sc.description,
-                    website=sc.website,
-                    source_url=sc.source_url,
-                    source_name=sc.source_name,
-                    page_url=sc.page_url,
-                    industry=sc.industry,
-                    location=sc.location,
-                    founded_year=sc.founded_year,
-                    founders=json.dumps(sc.founders) if sc.founders else None,
-                    funding_stage=sc.funding_stage,
-                    seeking_amount=sc.seeking_amount,
-                    is_raising=bool(sc.is_raising),
-                    activity_type=sc.activity_type,
-                    raising_evidence=sc.raising_evidence,
-                    is_new=True,
-                    is_seen=False,
-                )
-
-                # Tag matching topics (word boundary match to avoid "AI" matching "Airbnb")
-                import re as _re
-                searchable = f"{sc.name} {sc.description} {sc.industry}".lower()
-                for topic in active_topics:
-                    pattern = r'\b' + _re.escape(topic.name.lower()) + r'\b'
-                    if _re.search(pattern, searchable):
-                        company.topics.append(topic)
-
-                db.add(company)
-                new_companies.append(company)
-
-        except Exception as e:
-            print(f"Error scraping {source.url}: {e}")
-            continue
-
-    db.commit()
-
-    scan.finished_at = datetime.utcnow()
-    scan.sources_scanned = sources_scanned
-    scan.new_companies_found = len(new_companies)
-    scan.pages_crawled = total_pages
-    scan.status = "completed"
-    db.commit()
-
-    for c in new_companies:
-        db.refresh(c)
-
-    return ScanResult(
+@app.get("/api/scan/{scan_id}", response_model=ScanStatus)
+def get_scan_status(scan_id: int, db: Session = Depends(get_db)):
+    scan = db.query(ScanLog).filter(ScanLog.id == scan_id).first()
+    if not scan:
+        raise HTTPException(404, "Scan not found")
+    sources_total = db.query(Source).filter(Source.is_active == True).count()
+    return ScanStatus(
         scan_id=scan.id,
-        sources_scanned=sources_scanned,
-        new_companies_found=len(new_companies),
-        pages_crawled=total_pages,
-        status="completed",
-        companies=[CompanyOut.from_orm_company(c) for c in new_companies],
+        status=scan.status,
+        sources_scanned=scan.sources_scanned or 0,
+        sources_total=sources_total,
+        new_companies_found=scan.new_companies_found or 0,
+        pages_crawled=scan.pages_crawled or 0,
+        started_at=scan.started_at,
+        finished_at=scan.finished_at,
     )
 
 

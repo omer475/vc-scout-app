@@ -42,6 +42,7 @@ function App() {
   const [companies, setCompanies] = useState([])
   const [scanning, setScanning] = useState(false)
   const [scanResult, setScanResult] = useState(null)
+  const [scanProgress, setScanProgress] = useState(null) // { sources_scanned, sources_total, new_companies_found, pages_crawled }
   const [newSource, setNewSource] = useState({ name: '', url: '' })
   const [newTopic, setNewTopic] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
@@ -213,6 +214,7 @@ function App() {
   const runScan = async () => {
     setScanning(true)
     setScanResult(null)
+    setScanProgress(null)
     setError('')
     // Save to recents
     if (scanCountry.trim()) {
@@ -233,14 +235,46 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-      if (res.ok) {
-        const data = await res.json()
-        setScanResult(data)
-        fetchCompanies(); fetchStats(); fetchSources()
-        setTab('results')
-      } else {
-        const data = await res.json()
-        setError(data.detail || 'Scan failed')
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        setError(data.detail || 'Scan failed to start')
+        setScanning(false)
+        return
+      }
+      const { scan_id, sources_total } = await res.json()
+      setScanProgress({ sources_scanned: 0, sources_total, new_companies_found: 0, pages_crawled: 0 })
+
+      // Poll every 3s until completed/failed
+      const poll = async () => {
+        try {
+          const r = await fetch(`${API}/scan/${scan_id}`)
+          if (!r.ok) return true // stop on error
+          const s = await r.json()
+          setScanProgress({
+            sources_scanned: s.sources_scanned,
+            sources_total: s.sources_total,
+            new_companies_found: s.new_companies_found,
+            pages_crawled: s.pages_crawled,
+          })
+          if (s.status === 'completed' || s.status === 'failed') {
+            setScanResult({
+              scan_id: s.scan_id,
+              status: s.status,
+              sources_scanned: s.sources_scanned,
+              new_companies_found: s.new_companies_found,
+              pages_crawled: s.pages_crawled,
+            })
+            fetchCompanies(); fetchStats(); fetchSources()
+            setTab('results')
+            return true
+          }
+          return false
+        } catch {
+          return false
+        }
+      }
+      while (!(await poll())) {
+        await new Promise(r => setTimeout(r, 3000))
       }
     } catch {
       setError('Connection failed. Is the backend running?')
@@ -288,7 +322,11 @@ function App() {
           <h1>VC Scout {STATIC_MODE && <span className="static-badge">Read-only snapshot</span>}</h1>
           {!STATIC_MODE && (
             <button className={`btn-primary ${scanning ? 'loading' : ''}`} onClick={() => { if (!scanning) setShowScanModal(true) }} disabled={scanning}>
-              {scanning ? 'Scanning...' : 'Run Scan'}
+              {scanning
+                ? (scanProgress
+                    ? `Scanning ${scanProgress.sources_scanned}/${scanProgress.sources_total} • ${scanProgress.new_companies_found} found`
+                    : 'Scanning...')
+                : 'Run Scan'}
             </button>
           )}
         </div>
