@@ -7,6 +7,7 @@ import './App.css'
 const STATIC_MODE = import.meta.env.VITE_STATIC === '1'
 const API_BASE = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '')
 const API = STATIC_MODE ? null : `${API_BASE}/api`
+if (typeof window !== 'undefined') console.log('[VC Scout] API =', API, 'STATIC =', STATIC_MODE)
 let _snapshot = null
 async function loadSnapshot() {
   if (_snapshot) return _snapshot
@@ -149,7 +150,7 @@ function App() {
         const data = await res.json()
         setError(data.detail || 'Failed to add source')
       }
-    } catch { setError('Connection failed') }
+    } catch (e) { setError(`Connection failed → ${API} :: ${e?.message || e}`) }
   }
 
   const deleteSource = async (id) => {
@@ -179,7 +180,7 @@ function App() {
         const data = await res.json()
         setError(data.detail || 'Failed')
       }
-    } catch { setError('Connection failed') }
+    } catch (e) { setError(`Connection failed → ${API} :: ${e?.message || e}`) }
   }
 
   const deleteTopic = async (id) => {
@@ -276,8 +277,8 @@ function App() {
       while (!(await poll())) {
         await new Promise(r => setTimeout(r, 3000))
       }
-    } catch {
-      setError('Connection failed. Is the backend running?')
+    } catch (e) {
+      setError(`Connection failed → ${API} :: ${e?.message || e}`)
     }
     setScanning(false)
   }
