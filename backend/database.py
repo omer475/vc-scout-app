@@ -81,6 +81,36 @@ class ScanLog(Base):
     status = Column(String(50), default="running")
 
 
+class FirmDoc(Base):
+    """A piece of the firm's own knowledge: a thesis doc, a past memo,
+    a pass reason, a portfolio list. This is what new decks get judged against."""
+    __tablename__ = "firm_docs"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(300), nullable=False)
+    doc_type = Column(String(40), default="other")  # thesis | memo | pass_reason | portfolio | other
+    content = Column(Text, nullable=False)
+    source_filename = Column(String(300), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class FitMemo(Base):
+    """The output: an AI-written assessment of one pitch deck against the firm's knowledge."""
+    __tablename__ = "fit_memos"
+    id = Column(Integer, primary_key=True, index=True)
+    company_name = Column(String(300), nullable=True)
+    one_liner = Column(Text, nullable=True)
+    verdict = Column(String(40), nullable=True)  # strong_fit | possible_fit | weak_fit | pass
+    fit_score = Column(Integer, nullable=True)   # 0-100
+    memo_markdown = Column(Text, nullable=True)
+    deck_filename = Column(String(300), nullable=True)
+    deck_excerpt = Column(Text, nullable=True)
+    docs_used = Column(Integer, default=0)
+    model = Column(String(80), nullable=True)
+    status = Column(String(40), default="completed")  # completed | failed
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 

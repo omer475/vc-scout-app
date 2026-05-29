@@ -26,6 +26,58 @@ const COUNTRIES = [
   'Mexico', 'Colombia', 'Argentina', 'Chile', 'China',
 ]
 
+const DOC_TYPES = [
+  { id: 'thesis', label: 'Investment thesis' },
+  { id: 'memo', label: 'Past memo' },
+  { id: 'pass_reason', label: 'Pass reason' },
+  { id: 'portfolio', label: 'Portfolio' },
+  { id: 'other', label: 'Other' },
+]
+const DOC_TYPE_LABEL = Object.fromEntries(DOC_TYPES.map(d => [d.id, d.label]))
+
+const VERDICT_META = {
+  strong_fit: { label: 'Strong fit', cls: 'verdict-strong' },
+  possible_fit: { label: 'Possible fit', cls: 'verdict-possible' },
+  weak_fit: { label: 'Weak fit', cls: 'verdict-weak' },
+  pass: { label: 'Pass', cls: 'verdict-pass' },
+}
+
+// Tiny markdown renderer (headings, bold, bullets) — avoids adding a dependency.
+function renderMarkdown(md) {
+  if (!md) return null
+  const lines = md.split('\n')
+  const out = []
+  let list = []
+  const flush = () => {
+    if (list.length) { out.push(<ul key={`ul-${out.length}`}>{list}</ul>); list = [] }
+  }
+  const inline = (text) =>
+    text.split(/(\*\*[^*]+\*\*)/g).map((part, i) =>
+      part.startsWith('**') && part.endsWith('**')
+        ? <strong key={i}>{part.slice(2, -2)}</strong>
+        : part)
+  lines.forEach((raw, idx) => {
+    const line = raw.trimEnd()
+    if (/^#{1,6}\s/.test(line)) {
+      flush()
+      const level = line.match(/^#+/)[0].length
+      const text = line.replace(/^#+\s/, '')
+      out.push(level <= 2
+        ? <h4 key={idx}>{inline(text)}</h4>
+        : <h5 key={idx}>{inline(text)}</h5>)
+    } else if (/^\s*[-*]\s/.test(line)) {
+      list.push(<li key={idx}>{inline(line.replace(/^\s*[-*]\s/, ''))}</li>)
+    } else if (line.trim() === '') {
+      flush()
+    } else {
+      flush()
+      out.push(<p key={idx}>{inline(line)}</p>)
+    }
+  })
+  flush()
+  return out
+}
+
 function loadRecent(key) {
   try { return JSON.parse(localStorage.getItem(key) || '[]') } catch { return [] }
 }
@@ -62,6 +114,13 @@ function App() {
   const [yearMin, setYearMin] = useState('')
   const [yearMax, setYearMax] = useState('')
   const [locationFilter, setLocationFilter] = useState('')
+  // Deal Fit (fit-memo) state
+  const [firmDocs, setFirmDocs] = useState([])
+  const [memos, setMemos] = useState([])
+  const [docForm, setDocForm] = useState({ title: '', doc_type: 'thesis', content: '' })
+  const [docUploading, setDocUploading] = useState(false)
+  const [analyzing, setAnalyzing] = useState(false)
+  const [activeMemo, setActiveMemo] = useState(null)
 
   const fetchStats = useCallback(async () => {
     try {
@@ -127,9 +186,26 @@ function App() {
     } catch {}
   }, [showNewOnly, showRaisingOnly, activityFilter, searchQuery, topicFilter, yearMin, yearMax, locationFilter])
 
+  const fetchFirmDocs = useCallback(async () => {
+    if (STATIC_MODE) return
+    try {
+      const res = await fetch(`${API}/firm-docs`)
+      if (res.ok) setFirmDocs(await res.json())
+    } catch {}
+  }, [])
+
+  const fetchMemos = useCallback(async () => {
+    if (STATIC_MODE) return
+    try {
+      const res = await fetch(`${API}/memos`)
+      if (res.ok) setMemos(await res.json())
+    } catch {}
+  }, [])
+
   useEffect(() => {
     fetchStats(); fetchSources(); fetchTopics(); fetchCompanies()
-  }, [fetchStats, fetchSources, fetchTopics, fetchCompanies])
+    fetchFirmDocs(); fetchMemos()
+  }, [fetchStats, fetchSources, fetchTopics, fetchCompanies, fetchFirmDocs, fetchMemos])
 
   useEffect(() => { fetchCompanies() }, [showNewOnly, showRaisingOnly, activityFilter, searchQuery, topicFilter, yearMin, yearMax, locationFilter, fetchCompanies])
 
@@ -305,6 +381,79 @@ function App() {
     window.open(`${API}/export/excel?${params}`, '_blank')
   }
 
+  // ── Deal Fit handlers ──
+
+  const addDocText = async (e) => {
+    e.preventDefault()
+    setError('')
+    if (!docForm.content.trim()) { setError('Paste some text first.'); return }
+    try {
+      const res = await fetch(`${API}/firm-docs/text`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: docForm.title.trim() || 'Untitled',
+          doc_type: docForm.doc_type,
+          content: docForm.content,
+        }),
+      })
+      if (res.ok) {
+        setDocForm({ title: '', doc_type: docForm.doc_type, content: '' })
+        fetchFirmDocs()
+      } else {
+        setError((await res.json()).detail || 'Failed to save document')
+      }
+    } catch (e) { setError(`Connection failed → ${API} :: ${e?.message || e}`) }
+  }
+
+  const uploadDocFile = async (fileList) => {
+    const file = fileList?.[0]
+    if (!file) return
+    setError('')
+    setDocUploading(true)
+    try {
+      const fd = new FormData()
+      fd.append('file', file)
+      fd.append('doc_type', docForm.doc_type)
+      const res = await fetch(`${API}/firm-docs/upload`, { method: 'POST', body: fd })
+      if (res.ok) fetchFirmDocs()
+      else setError((await res.json()).detail || 'Failed to read that file')
+    } catch (e) { setError(`Connection failed → ${API} :: ${e?.message || e}`) }
+    setDocUploading(false)
+  }
+
+  const deleteFirmDoc = async (id) => {
+    await fetch(`${API}/firm-docs/${id}`, { method: 'DELETE' })
+    fetchFirmDocs()
+  }
+
+  const analyzeDeck = async (fileList) => {
+    const file = fileList?.[0]
+    if (!file) return
+    setError('')
+    setAnalyzing(true)
+    setActiveMemo(null)
+    try {
+      const fd = new FormData()
+      fd.append('file', file)
+      const res = await fetch(`${API}/analyze-deck`, { method: 'POST', body: fd })
+      if (res.ok) {
+        const memo = await res.json()
+        setActiveMemo(memo)
+        fetchMemos()
+      } else {
+        setError((await res.json()).detail || 'Analysis failed')
+      }
+    } catch (e) { setError(`Connection failed → ${API} :: ${e?.message || e}`) }
+    setAnalyzing(false)
+  }
+
+  const deleteMemo = async (id) => {
+    await fetch(`${API}/memos/${id}`, { method: 'DELETE' })
+    if (activeMemo?.id === id) setActiveMemo(null)
+    fetchMemos()
+  }
+
   const filteredCountries = countrySearch
     ? COUNTRIES.filter(c => c.toLowerCase().includes(countrySearch.toLowerCase()))
     : []
@@ -314,6 +463,7 @@ function App() {
     { id: 'sources', label: 'Sources' },
     { id: 'topics', label: 'Topics' },
     { id: 'results', label: `Companies${stats?.new_companies ? ` (${stats.new_companies})` : ''}` },
+    { id: 'dealfit', label: 'Deal Fit' },
   ]
 
   return (
@@ -707,6 +857,113 @@ function App() {
                     ))}
                   </tbody>
                 </table>
+              </div>
+            )}
+          </section>
+        )}
+
+        {tab === 'dealfit' && (
+          <section className="dealfit">
+            {STATIC_MODE ? (
+              <p className="empty">Deal Fit needs a live backend. It's disabled in the read-only snapshot.</p>
+            ) : (
+              <div className="dealfit-grid">
+                {/* Left: firm knowledge base */}
+                <div className="dealfit-col">
+                  <h2>Firm Knowledge</h2>
+                  <p className="muted">Add your firm's own material — thesis, past memos, reasons you passed, portfolio. New decks get judged against this.</p>
+
+                  <div className="doc-uploader">
+                    <label>Type</label>
+                    <select value={docForm.doc_type} onChange={e => setDocForm({ ...docForm, doc_type: e.target.value })}>
+                      {DOC_TYPES.map(d => <option key={d.id} value={d.id}>{d.label}</option>)}
+                    </select>
+                    <label className="file-btn">
+                      {docUploading ? 'Reading…' : 'Upload file (PDF / Word / text)'}
+                      <input type="file" accept=".pdf,.docx,.txt,.md,.csv" disabled={docUploading}
+                        onChange={e => { uploadDocFile(e.target.files); e.target.value = '' }} />
+                    </label>
+                  </div>
+
+                  <form className="doc-paste" onSubmit={addDocText}>
+                    <input placeholder="Title (optional)" value={docForm.title}
+                      onChange={e => setDocForm({ ...docForm, title: e.target.value })} />
+                    <textarea placeholder="…or paste text here (e.g. your thesis, a pass reason)" rows={4}
+                      value={docForm.content} onChange={e => setDocForm({ ...docForm, content: e.target.value })} />
+                    <button type="submit" className="btn-primary">Add to knowledge base</button>
+                  </form>
+
+                  {firmDocs.length === 0
+                    ? <p className="empty">No firm knowledge yet.</p>
+                    : <div className="list">
+                        {firmDocs.map(d => (
+                          <div key={d.id} className="list-row">
+                            <div className="list-info">
+                              <strong>{d.title}</strong>
+                              <span className="muted small">{DOC_TYPE_LABEL[d.doc_type] || d.doc_type} · {d.char_count.toLocaleString()} chars</span>
+                            </div>
+                            <button className="btn-sm danger" onClick={() => deleteFirmDoc(d.id)}>Delete</button>
+                          </div>
+                        ))}
+                      </div>}
+                </div>
+
+                {/* Right: analyze a deck */}
+                <div className="dealfit-col">
+                  <h2>Analyze a Deck</h2>
+                  <p className="muted">Upload a pitch deck (PDF). You'll get a fit memo grounded in the knowledge on the left.</p>
+
+                  <label className={`deck-drop ${analyzing ? 'busy' : ''}`}>
+                    {analyzing ? 'Analyzing deck… this takes ~20–40s' : 'Upload pitch deck (PDF) →'}
+                    <input type="file" accept=".pdf,.docx,.txt,.md" disabled={analyzing}
+                      onChange={e => { analyzeDeck(e.target.files); e.target.value = '' }} />
+                  </label>
+                  {firmDocs.length === 0 && !analyzing && (
+                    <p className="muted small">Tip: add some firm knowledge first, or the memo will have nothing to cite.</p>
+                  )}
+
+                  {activeMemo && (
+                    <div className="memo-card">
+                      <div className="memo-head">
+                        <div>
+                          <h3>{activeMemo.company_name || activeMemo.deck_filename || 'Memo'}</h3>
+                          {activeMemo.one_liner && <p className="muted">{activeMemo.one_liner}</p>}
+                        </div>
+                        <div className="memo-verdict">
+                          {activeMemo.verdict && (
+                            <span className={`verdict-badge ${VERDICT_META[activeMemo.verdict]?.cls || ''}`}>
+                              {VERDICT_META[activeMemo.verdict]?.label || activeMemo.verdict}
+                            </span>
+                          )}
+                          {typeof activeMemo.fit_score === 'number' && <span className="fit-score">{activeMemo.fit_score}<small>/100</small></span>}
+                        </div>
+                      </div>
+                      <div className="memo-body">{renderMarkdown(activeMemo.memo_markdown)}</div>
+                      <p className="muted small">Based on {activeMemo.docs_used} firm doc(s) · {activeMemo.model}</p>
+                    </div>
+                  )}
+
+                  {memos.length > 0 && (
+                    <div className="memo-history">
+                      <h4>Past memos</h4>
+                      <div className="list">
+                        {memos.map(m => (
+                          <div key={m.id} className={`list-row ${activeMemo?.id === m.id ? 'dimmed' : ''}`}>
+                            <div className="list-info" style={{ cursor: 'pointer' }} onClick={() => setActiveMemo(m)}>
+                              <strong>{m.company_name || m.deck_filename || `Memo #${m.id}`}</strong>
+                              <span className="muted small">
+                                {m.verdict ? (VERDICT_META[m.verdict]?.label || m.verdict) : m.status}
+                                {typeof m.fit_score === 'number' ? ` · ${m.fit_score}/100` : ''}
+                                {' · '}{new Date(m.created_at).toLocaleDateString()}
+                              </span>
+                            </div>
+                            <button className="btn-sm danger" onClick={() => deleteMemo(m.id)}>Del</button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
             )}
           </section>

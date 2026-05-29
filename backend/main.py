@@ -15,7 +15,7 @@ if env_path.exists():
             key, val = line.split("=", 1)
             os.environ.setdefault(key.strip(), val.strip())
 
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -23,8 +23,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from openpyxl import Workbook
 
-from database import init_db, get_db, SessionLocal, Source, Topic, Company, ScanLog, company_topics
+from database import (
+    init_db, get_db, SessionLocal, Source, Topic, Company, ScanLog, company_topics,
+    FirmDoc, FitMemo,
+)
 from scraper import crawl_and_extract
+import fit_memo as fit
 
 app = FastAPI(title="VC Scout", version="2.0.0")
 
@@ -736,6 +740,162 @@ def seed_sources_tr(db: Session = Depends(get_db)):
         added += 1
     db.commit()
     return {"ok": True, "sources_added": added}
+
+
+# ── Firm knowledge base ──
+
+class FirmDocOut(BaseModel):
+    id: int
+    title: str
+    doc_type: str
+    char_count: int
+    source_filename: Optional[str] = None
+    created_at: datetime
+
+class FirmDocText(BaseModel):
+    title: str
+    doc_type: str = "other"
+    content: str
+
+
+def _firm_doc_out(d: FirmDoc) -> FirmDocOut:
+    return FirmDocOut(
+        id=d.id, title=d.title, doc_type=d.doc_type,
+        char_count=len(d.content or ""), source_filename=d.source_filename,
+        created_at=d.created_at,
+    )
+
+
+@app.get("/api/firm-docs", response_model=list[FirmDocOut])
+def list_firm_docs(db: Session = Depends(get_db)):
+    docs = db.query(FirmDoc).order_by(FirmDoc.created_at.desc()).all()
+    return [_firm_doc_out(d) for d in docs]
+
+
+@app.post("/api/firm-docs/text", response_model=FirmDocOut)
+def add_firm_doc_text(data: FirmDocText, db: Session = Depends(get_db)):
+    if not data.content.strip():
+        raise HTTPException(400, "Content is empty")
+    doc = FirmDoc(title=data.title or "Untitled", doc_type=data.doc_type, content=data.content)
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+    return _firm_doc_out(doc)
+
+
+@app.post("/api/firm-docs/upload", response_model=FirmDocOut)
+async def add_firm_doc_file(
+    file: UploadFile = File(...),
+    doc_type: str = Form("other"),
+    title: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    raw = await file.read()
+    try:
+        text = fit.extract_text(file.filename, raw)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    if not text.strip():
+        raise HTTPException(400, "Could not read any text from that file. If it's a scanned PDF, paste the text instead.")
+    doc = FirmDoc(
+        title=title or file.filename or "Untitled",
+        doc_type=doc_type,
+        content=text,
+        source_filename=file.filename,
+    )
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+    return _firm_doc_out(doc)
+
+
+@app.delete("/api/firm-docs/{doc_id}")
+def delete_firm_doc(doc_id: int, db: Session = Depends(get_db)):
+    doc = db.query(FirmDoc).filter(FirmDoc.id == doc_id).first()
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    db.delete(doc)
+    db.commit()
+    return {"ok": True}
+
+
+# ── Fit memos (deck analysis) ──
+
+class FitMemoOut(BaseModel):
+    id: int
+    company_name: Optional[str] = None
+    one_liner: Optional[str] = None
+    verdict: Optional[str] = None
+    fit_score: Optional[int] = None
+    memo_markdown: Optional[str] = None
+    deck_filename: Optional[str] = None
+    docs_used: int = 0
+    model: Optional[str] = None
+    status: str = "completed"
+    error: Optional[str] = None
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+
+def _analyze_and_store(deck_text: str, deck_filename: Optional[str], db: Session) -> FitMemo:
+    docs = db.query(FirmDoc).order_by(FirmDoc.created_at).all()
+    memo = FitMemo(deck_filename=deck_filename, docs_used=len(docs), model=fit.ANTHROPIC_MODEL)
+    try:
+        result = fit.generate_fit_memo(deck_text, docs)
+        memo.company_name = result.get("company_name")
+        memo.one_liner = result.get("one_liner")
+        memo.verdict = result.get("verdict")
+        memo.fit_score = result.get("fit_score")
+        memo.memo_markdown = result.get("memo_markdown")
+        memo.deck_excerpt = deck_text[:2000]
+        memo.status = "completed"
+    except RuntimeError as e:
+        memo.status = "failed"
+        memo.error = str(e)
+    db.add(memo)
+    db.commit()
+    db.refresh(memo)
+    return memo
+
+
+@app.post("/api/analyze-deck", response_model=FitMemoOut)
+async def analyze_deck(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    raw = await file.read()
+    try:
+        deck_text = fit.extract_text(file.filename, raw)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    memo = _analyze_and_store(deck_text, file.filename, db)
+    if memo.status == "failed":
+        raise HTTPException(400, memo.error or "Analysis failed")
+    return memo
+
+
+@app.get("/api/memos", response_model=list[FitMemoOut])
+def list_memos(db: Session = Depends(get_db)):
+    return db.query(FitMemo).order_by(FitMemo.created_at.desc()).all()
+
+
+@app.get("/api/memos/{memo_id}", response_model=FitMemoOut)
+def get_memo(memo_id: int, db: Session = Depends(get_db)):
+    memo = db.query(FitMemo).filter(FitMemo.id == memo_id).first()
+    if not memo:
+        raise HTTPException(404, "Memo not found")
+    return memo
+
+
+@app.delete("/api/memos/{memo_id}")
+def delete_memo(memo_id: int, db: Session = Depends(get_db)):
+    memo = db.query(FitMemo).filter(FitMemo.id == memo_id).first()
+    if not memo:
+        raise HTTPException(404, "Memo not found")
+    db.delete(memo)
+    db.commit()
+    return {"ok": True}
 
 
 if __name__ == "__main__":
